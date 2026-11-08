@@ -17,6 +17,7 @@ import (
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/ocm"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/pod"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/reportxml"
+	siteconfigv1alpha1 "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/siteconfig/v1alpha1"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/siteconfig"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/gitopsztp/internal/gitdetails"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/gitopsztp/internal/tsparams"
@@ -24,6 +25,7 @@ import (
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/ranhelper"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/ranparam"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/version"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	. "github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/raninittools"
 )
@@ -203,6 +205,113 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 
 			_, err = siteconfig.PullClusterInstance(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
 			Expect(err).ToNot(HaveOccurred(), "Failed to find cluster instance custom resource")
+		})
+
+		// 24973 - Detach and redeploy the AI multi-node openshift (MNO) spoke cluster.
+		It("Validate detaching and redeploying the AI multi-node openshift spoke cluster", reportxml.ID("24973"), func() {
+			By("checking spoke cluster type")
+
+			spokeClusterType, err := rancluster.CheckSpokeClusterType(RANConfig.Spoke1APIClient)
+			Expect(err).ToNot(HaveOccurred(), "Failed to fetch spoke cluster type")
+
+			if spokeClusterType == ranparam.SNOCluster {
+				Skip("This test only applies to standard or multi-node openshift spoke cluster")
+			}
+
+			By("checking if the ztp test path exists")
+
+			if !clustersApp.DoesGitPathExist(tsparams.ZtpTestPathDetachAIMNO) {
+				Skip(fmt.Sprintf("git path '%s' could not be found", tsparams.ZtpTestPathDetachAIMNO))
+			}
+
+			By("recording the spoke cluster identity before detachment")
+
+			clusterDeployment, err := hive.PullClusterDeployment(
+				HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke cluster deployment before detachment")
+
+			originalClusterID := clusterDeployment.Object.Spec.ClusterMetadata.ClusterID
+			originalInfraID := clusterDeployment.Object.Spec.ClusterMetadata.InfraID
+			Expect(originalClusterID).ToNot(BeEmpty(), "Spoke cluster deployment has no cluster ID")
+			Expect(originalInfraID).ToNot(BeEmpty(), "Spoke cluster deployment has no infra ID")
+
+			By("detaching the spoke cluster with the detach test path")
+
+			err = gitdetails.UpdateAndWaitForSync(clustersApp, true, tsparams.ZtpTestPathDetachAIMNO)
+			Expect(err).ToNot(HaveOccurred(), "Failed to update the clusters app git path")
+
+			validateAISpokeClusterInstallCRsRemoved()
+
+			By("verifying the cluster instance remains on the hub during detachment")
+
+			_, err = siteconfig.PullClusterInstance(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find cluster instance custom resource during detachment")
+
+			By("restoring the original clusters app path to redeploy the spoke cluster")
+
+			err = gitdetails.UpdateAndWaitForSync(clustersApp, true, originalClustersGitPath)
+			Expect(err).ToNot(HaveOccurred(), "Failed to restore the original clusters app git path")
+
+			By("waiting for the cluster instance to complete provisioning")
+
+			clusterInstance, err := siteconfig.PullClusterInstance(
+				HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find cluster instance after restoring the clusters app path")
+
+			_, err = clusterInstance.WaitForCondition(metav1.Condition{
+				Type:   string(siteconfigv1alpha1.ClusterProvisioned),
+				Reason: string(siteconfigv1alpha1.Completed),
+			}, 60*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "Failed to wait for cluster instance provisioning to complete")
+
+			By("verifying the cluster remains operational after redeployment")
+
+			_, err = version.GetOCPVersion(Spoke1APIClient)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get OCP version from spoke after redeployment")
+
+			By("verifying redeployment preserved the spoke cluster identity")
+
+			clusterDeployment, err = hive.PullClusterDeployment(
+				HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke cluster deployment after redeployment")
+			Expect(clusterDeployment.Object.Spec.ClusterMetadata.ClusterID).To(Equal(originalClusterID),
+				"Redeployed spoke cluster has a different cluster ID")
+			Expect(clusterDeployment.Object.Spec.ClusterMetadata.InfraID).To(Equal(originalInfraID),
+				"Redeployed spoke cluster has a different infra ID")
+
+			By("verifying the spoke cluster is available on the hub after redeployment")
+
+			managedCluster, err := ocm.PullManagedCluster(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke managed cluster after redeployment")
+
+			_, err = managedCluster.WaitForCondition(metav1.Condition{
+				Type:   "ManagedClusterConditionAvailable",
+				Status: metav1.ConditionTrue,
+			}, 12*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "Failed to wait for spoke managed cluster to become available")
+
+			managedClusterID, err := rancluster.GetManagedClusterID(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get spoke managed cluster ID after redeployment")
+			Expect(managedClusterID).To(Equal(originalClusterID),
+				"Redeployed spoke managed cluster has a different cluster ID")
+
+			By("verifying hub management resources are restored")
+
+			_, err = assisted.PullInfraEnvInstall(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke infra env after redeployment")
+
+			_, err = bmh.Pull(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke bare metal host after redeployment")
+
+			nmStateConfigList, err := assisted.ListNmStateConfigs(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke NM state configs after redeployment")
+			Expect(nmStateConfigList).ToNot(BeEmpty(), "Spoke NM state configs are missing after redeployment")
+
+			_, err = assisted.PullAgentClusterInstall(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke agent cluster install after redeployment")
+
+			_, err = ocm.PullKAC(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke klusterlet addon config after redeployment")
 		})
 
 		// 75376 - Detaching the AI single-node openshift (SNO) spoke cluster.
