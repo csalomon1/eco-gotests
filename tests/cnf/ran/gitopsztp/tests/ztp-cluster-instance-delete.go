@@ -75,13 +75,15 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 
 			By("checking the infra env manifests exists on hub")
 
-			_, err = assisted.PullInfraEnvInstall(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke infra env manifests")
+			infraEnvList, err := assisted.ListInfraEnvs(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke infra env manifests")
+			Expect(infraEnvList).ToNot(BeEmpty(), "Failed to find spoke infra env manifests")
 
 			By("checking the bare metal host manifests exists on hub")
 
-			_, err = bmh.Pull(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke bmh manifests")
+			bmhList, err := bmh.List(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke bmh manifests")
+			Expect(bmhList).ToNot(BeEmpty(), "Failed to find spoke bmh manifests")
 
 			By("checking the cluster deployment manifests exists on hub")
 
@@ -297,11 +299,13 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 
 			By("verifying hub management resources are restored")
 
-			_, err = assisted.PullInfraEnvInstall(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke infra env after redeployment")
+			infraEnvList, err := assisted.ListInfraEnvs(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke infra envs after redeployment")
+			Expect(infraEnvList).ToNot(BeEmpty(), "Failed to find spoke infra env after redeployment")
 
-			_, err = bmh.Pull(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke bare metal host after redeployment")
+			bmhList, err := bmh.List(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke bare metal hosts after redeployment")
+			Expect(bmhList).ToNot(BeEmpty(), "Failed to find spoke bare metal host after redeployment")
 
 			nmStateConfigList, err := assisted.ListNmStateConfigs(HubAPIClient, RANConfig.Spoke1Name)
 			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke NM state configs after redeployment")
@@ -346,13 +350,15 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 func validateAISpokeClusterInstallCRsRemoved() {
 	By("checking the infra env manifests removed on hub")
 
-	_, err := assisted.PullInfraEnvInstall(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-	Expect(err).To(HaveOccurred(), "Found spoke infra env manifests but expected to be removed")
+	infraEnvList, err := assisted.ListInfraEnvs(HubAPIClient, RANConfig.Spoke1Name)
+	Expect(err).ToNot(HaveOccurred(), "Failed to list spoke infra env manifests")
+	Expect(infraEnvList).To(BeEmpty(), "Found spoke infra env manifests but expected to be removed")
 
 	By("checking the bare metal host manifests removed on hub")
 
-	_, err = bmh.Pull(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-	Expect(err).To(HaveOccurred(), "Found spoke bmh manifests but expected to be removed")
+	bmhList, err := bmh.List(HubAPIClient, RANConfig.Spoke1Name)
+	Expect(err).ToNot(HaveOccurred(), "Failed to list spoke bmh manifests")
+	Expect(bmhList).To(BeEmpty(), "Found spoke bmh manifests but expected to be removed")
 
 	By("checking the cluster deployment manifests removed on hub")
 
