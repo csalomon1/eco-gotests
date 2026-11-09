@@ -1,12 +1,19 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	"github.com/onsi/ginkgo/v2/types"
 	. "github.com/onsi/gomega"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	alertmanagerv2 "github.com/prometheus/alertmanager/api/v2/client"
+	alertmanageralert "github.com/prometheus/alertmanager/api/v2/client/alert"
+	"github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/argocd"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/assisted"
@@ -17,15 +24,23 @@ import (
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/ocm"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/pod"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/reportxml"
+	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/route"
+	argocdtypes "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/argocd/argocdtypes/v1alpha1"
 	siteconfigv1alpha1 "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/siteconfig/v1alpha1"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/siteconfig"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/gitopsztp/internal/gitdetails"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/gitopsztp/internal/tsparams"
+	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/alerter"
+	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/querier"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/rancluster"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/ranhelper"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/ranparam"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/version"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	. "github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/internal/raninittools"
 )
@@ -33,8 +48,15 @@ import (
 var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 	Label(tsparams.LabelClusterInstanceDeleteTestCases), func() {
 		var (
-			clustersApp             *argocd.ApplicationBuilder
-			originalClustersGitPath string
+			clustersApp                *argocd.ApplicationBuilder
+			originalClustersGitPath    string
+			originalClustersSyncPolicy *argocdtypes.SyncPolicy
+			clusterInstanceForCleanup  *siteconfigv1alpha1.ClusterInstance
+			clusterInstanceDeleted     bool
+			clusterRedeployProbeRule   *monitoringv1.PrometheusRule
+			acmObservabilityMetricsAPI v1.API
+			acmObservabilityAlertsAPI  *alertmanagerv2.AlertmanagerAPI
+			querierResourcesCreated    bool
 		)
 
 		BeforeEach(func() {
@@ -55,6 +77,7 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 
 			originalClustersGitPath, err = gitdetails.GetGitPath(clustersApp)
 			Expect(err).ToNot(HaveOccurred(), "Failed to get the original clusters app git path")
+			originalClustersSyncPolicy = clustersApp.Definition.Spec.SyncPolicy.DeepCopy()
 		})
 
 		AfterEach(func() {
@@ -62,11 +85,39 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 				return
 			}
 
+			if clusterRedeployProbeRule != nil {
+				By("removing the temporary spoke alert rule")
+
+				err := Spoke1APIClient.Delete(context.Background(), clusterRedeployProbeRule)
+				if err != nil && !k8serrors.IsNotFound(err) {
+					Expect(err).ToNot(HaveOccurred(), "Failed to remove the temporary spoke alert rule")
+				}
+				clusterRedeployProbeRule = nil
+			}
+
 			By("resetting the clusters app back to the original settings")
 
 			clustersApp.Definition.Spec.Source.Path = originalClustersGitPath
+			clustersApp.Definition.Spec.SyncPolicy = originalClustersSyncPolicy.DeepCopy()
 			updatedApp, err := clustersApp.Update(true)
 			Expect(err).ToNot(HaveOccurred(), "Failed to update clusters app back to the original settings")
+
+			if clusterInstanceDeleted && clusterInstanceForCleanup != nil {
+				By("restoring the deleted cluster instance after the test")
+
+				err := recreateClusterInstance(clusterInstanceForCleanup, 60*time.Minute)
+				Expect(err).ToNot(HaveOccurred(), "Failed to restore the deleted spoke cluster instance")
+				clusterInstanceDeleted = false
+			}
+			clusterInstanceForCleanup = nil
+
+			if querierResourcesCreated {
+				By("removing temporary hub metrics query permissions")
+
+				err := querier.CleanupQuerierResources(HubAPIClient)
+				Expect(err).ToNot(HaveOccurred(), "Failed to remove temporary hub metrics query permissions")
+				querierResourcesCreated = false
+			}
 
 			By("waiting for the clusters app to sync")
 
@@ -220,11 +271,23 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 				Skip("This test only applies to standard or multi-node openshift spoke cluster")
 			}
 
-			By("checking if the ztp test path exists")
+			By("checking that the spoke cluster instance is provisioned")
 
-			if !clustersApp.DoesGitPathExist(tsparams.ZtpTestPathDetachAIMNO) {
-				Skip(fmt.Sprintf("git path '%s' could not be found", tsparams.ZtpTestPathDetachAIMNO))
-			}
+			clusterInstance, err := siteconfig.PullClusterInstance(
+				HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke cluster instance before detachment")
+			_, err = clusterInstance.WaitForCondition(metav1.Condition{
+				Type:   string(siteconfigv1alpha1.ClusterProvisioned),
+				Reason: string(siteconfigv1alpha1.Completed),
+			}, 5*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "Spoke cluster instance is not provisioned")
+			clusterInstanceForCleanup = clusterInstance.Definition.DeepCopy()
+
+			By("verifying the spoke uses bare metal hosts")
+
+			spokeBmhList, err := bmh.List(HubAPIClient, RANConfig.Spoke1Name)
+			Expect(err).ToNot(HaveOccurred(), "Failed to list spoke bare metal hosts before detachment")
+			Expect(spokeBmhList).ToNot(BeEmpty(), "Spoke has no bare metal hosts")
 
 			By("recording the spoke cluster identity before detachment")
 
@@ -237,39 +300,121 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 			Expect(originalClusterID).ToNot(BeEmpty(), "Spoke cluster deployment has no cluster ID")
 			Expect(originalInfraID).ToNot(BeEmpty(), "Spoke cluster deployment has no infra ID")
 
-			By("detaching the spoke cluster with the detach test path")
+			By("connecting to ACM Observability metrics")
 
-			err = gitdetails.UpdateAndWaitForSync(clustersApp, true, tsparams.ZtpTestPathDetachAIMNO)
-			Expect(err).ToNot(HaveOccurred(), "Failed to update the clusters app git path")
+			proxyRoute, err := route.Pull(
+				HubAPIClient, "rbac-query-proxy", ranparam.ACMObservabilityNamespace)
+			Expect(err).ToNot(HaveOccurred(), "Failed to find ACM Observability metrics route")
+			Expect(proxyRoute.Definition.Status.Ingress).ToNot(BeEmpty(), "ACM Observability metrics route has no host")
 
-			validateAISpokeClusterInstallCRsRemoved()
+			token, err := querier.GetQuerierToken(HubAPIClient)
+			querierResourcesCreated = true
+			Expect(err).ToNot(HaveOccurred(), "Failed to get a token for ACM Observability metrics")
 
-			By("verifying the cluster instance remains on the hub during detachment")
+			caPool, err := rancluster.GetClusterDefaultRouterCAPool(HubAPIClient)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get the hub router CA bundle")
 
-			_, err = siteconfig.PullClusterInstance(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find cluster instance custom resource during detachment")
+			acmObservabilityMetricsAPI, err = querier.CreatePrometheusAPI(
+				proxyRoute.Definition.Status.Ingress[0].Host, token, caPool)
+			Expect(err).ToNot(HaveOccurred(), "Failed to create the ACM Observability metrics client")
 
-			By("restoring the original clusters app path to redeploy the spoke cluster")
+			By("verifying that ACM currently receives metrics from the spoke")
 
-			err = gitdetails.UpdateAndWaitForSync(clustersApp, true, originalClustersGitPath)
-			Expect(err).ToNot(HaveOccurred(), "Failed to restore the original clusters app git path")
+			Eventually(func() (bool, error) {
+				return acmSpokeMetricExists(acmObservabilityMetricsAPI, RANConfig.Spoke1Name)
+			}).WithTimeout(12*time.Minute).WithPolling(30*time.Second).Should(BeTrue(),
+				"ACM Observability did not return cluster_infrastructure_provider metrics for the spoke")
 
-			By("waiting for the cluster instance to complete provisioning")
+			By("connecting to the ACM Observability Alertmanager")
 
-			clusterInstance, err := siteconfig.PullClusterInstance(
-				HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
-			Expect(err).ToNot(HaveOccurred(), "Failed to find cluster instance after restoring the clusters app path")
+			acmObservabilityAlertsAPI, err = alerter.CreateAlerterClientForCluster(HubAPIClient)
+			Expect(err).ToNot(HaveOccurred(), "Failed to create the ACM Observability Alertmanager client")
 
-			_, err = clusterInstance.WaitForCondition(metav1.Condition{
-				Type:   string(siteconfigv1alpha1.ClusterProvisioned),
-				Reason: string(siteconfigv1alpha1.Completed),
-			}, 60*time.Minute)
-			Expect(err).ToNot(HaveOccurred(), "Failed to wait for cluster instance provisioning to complete")
+			testID := uuid.NewString()
 
-			By("verifying the cluster remains operational after redeployment")
+			By("creating a temporary alert rule on the spoke to verify alert forwarding")
+
+			clusterRedeployProbeRule, err = createClusterRedeployProbeRule(testID)
+			Expect(err).ToNot(HaveOccurred(), "Failed to create a temporary spoke PrometheusRule")
+
+			By("verifying that ACM currently receives the spoke alert")
+
+			Eventually(func() (bool, error) {
+				return acmSpokeAlertExists(acmObservabilityAlertsAPI, testID)
+			}).WithTimeout(5*time.Minute).WithPolling(10*time.Second).Should(BeTrue(),
+				"ACM Observability did not receive the temporary alert from the spoke")
+
+			By("pausing Argo CD automated sync so it does not recreate the deleted ClusterInstance")
+
+			if clustersApp.Definition.Spec.SyncPolicy == nil {
+				clustersApp.Definition.Spec.SyncPolicy = &argocdtypes.SyncPolicy{}
+			}
+			clustersApp.Definition.Spec.SyncPolicy.Automated = nil
+			updatedClustersApp, err := clustersApp.Update(false)
+			Expect(err).ToNot(HaveOccurred(), "Failed to pause Argo CD automated sync")
+			clustersApp = updatedClustersApp
+
+			By("deleting the spoke ClusterInstance to detach it from the hub")
+
+			err = clusterInstance.Delete()
+			Expect(err).ToNot(HaveOccurred(), "Failed to delete the spoke ClusterInstance")
+			clusterInstanceDeleted = true
+
+			By("waiting for the ClusterInstance to be removed from the hub")
+
+			err = waitForClusterInstanceAbsent(RANConfig.Spoke1Name, 30*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "ClusterInstance was not removed from the hub")
+
+			By("waiting for the managed cluster to be detached from the hub")
+
+			err = waitForManagedClusterAbsent(RANConfig.Spoke1Name, 15*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "ManagedCluster was not detached from the hub")
+
+			By("verifying the spoke remains operational while detached")
 
 			_, err = version.GetOCPVersion(Spoke1APIClient)
-			Expect(err).ToNot(HaveOccurred(), "Failed to get OCP version from spoke after redeployment")
+			Expect(err).ToNot(HaveOccurred(), "Spoke cluster is not operational after detachment")
+			verifySpokeNodesReady()
+
+			By("verifying ACM stops receiving spoke metrics while detached")
+
+			Eventually(func() (bool, error) {
+				return acmSpokeMetricExists(acmObservabilityMetricsAPI, RANConfig.Spoke1Name)
+			}).WithTimeout(15*time.Minute).WithPolling(30*time.Second).Should(BeFalse(),
+				"ACM Observability continued returning spoke metrics after detachment")
+
+			By("verifying ACM stops receiving spoke alerts while detached")
+
+			Eventually(func() (bool, error) {
+				return acmSpokeAlertExists(acmObservabilityAlertsAPI, testID)
+			}).WithTimeout(15*time.Minute).WithPolling(15*time.Second).Should(BeFalse(),
+				"ACM Alertmanager continued returning the spoke alert after detachment")
+
+			By("recreating the saved ClusterInstance to reattach the running spoke")
+
+			err = recreateClusterInstance(clusterInstanceForCleanup, 60*time.Minute)
+			Expect(err).ToNot(HaveOccurred(), "Failed to recreate and provision the spoke ClusterInstance")
+			clusterInstanceDeleted = false
+
+			By("verifying ACM resumes receiving spoke metrics after reattachment")
+
+			Eventually(func() (bool, error) {
+				return acmSpokeMetricExists(acmObservabilityMetricsAPI, RANConfig.Spoke1Name)
+			}).WithTimeout(15*time.Minute).WithPolling(30*time.Second).Should(BeTrue(),
+				"ACM Observability did not resume receiving metrics from the spoke")
+
+			By("verifying ACM resumes receiving spoke alerts after reattachment")
+
+			Eventually(func() (bool, error) {
+				return acmSpokeAlertExists(acmObservabilityAlertsAPI, testID)
+			}).WithTimeout(15*time.Minute).WithPolling(15*time.Second).Should(BeTrue(),
+				"ACM Alertmanager did not resume receiving alerts from the spoke")
+
+			By("verifying the spoke remains operational after reattachment")
+
+			_, err = version.GetOCPVersion(Spoke1APIClient)
+			Expect(err).ToNot(HaveOccurred(), "Failed to access the spoke after reattachment")
+			verifySpokeNodesReady()
 
 			By("verifying redeployment preserved the spoke cluster identity")
 
@@ -281,7 +426,7 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 			Expect(clusterDeployment.Object.Spec.ClusterMetadata.InfraID).To(Equal(originalInfraID),
 				"Redeployed spoke cluster has a different infra ID")
 
-			By("verifying the spoke cluster is available on the hub after redeployment")
+			By("verifying the spoke cluster is available on the hub after reattachment")
 
 			managedCluster, err := ocm.PullManagedCluster(HubAPIClient, RANConfig.Spoke1Name)
 			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke managed cluster after redeployment")
@@ -316,6 +461,12 @@ var _ = Describe("ZTP Siteconfig Operator's Cluster Instance Delete Tests",
 
 			_, err = ocm.PullKAC(HubAPIClient, RANConfig.Spoke1Name, RANConfig.Spoke1Name)
 			Expect(err).ToNot(HaveOccurred(), "Failed to find spoke klusterlet addon config after redeployment")
+
+			By("removing the temporary spoke alert rule")
+
+			err = Spoke1APIClient.Delete(context.Background(), clusterRedeployProbeRule)
+			Expect(err).ToNot(HaveOccurred(), "Failed to remove the temporary spoke alert rule")
+			clusterRedeployProbeRule = nil
 		})
 
 		// 75376 - Detaching the AI single-node openshift (SNO) spoke cluster.
@@ -385,4 +536,174 @@ func validateAISpokeClusterInstallCRsRemoved() {
 
 	_, err = version.GetOCPVersion(Spoke1APIClient)
 	Expect(err).ToNot(HaveOccurred(), "Failed to get OCP version from spoke and verify spoke cluster access")
+}
+
+func createClusterRedeployProbeRule(testID string) (*monitoringv1.PrometheusRule, error) {
+	if err := Spoke1APIClient.AttachScheme(monitoringv1.AddToScheme); err != nil {
+		return nil, fmt.Errorf("failed to register PrometheusRule API scheme: %w", err)
+	}
+
+	rule := &monitoringv1.PrometheusRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "eco-gotests-redeploy-probe-" + uuid.NewString(),
+			Namespace: ranparam.OpenshiftMonitoringNamespace,
+			Labels: map[string]string{
+				"prometheus": "k8s",
+				"role":       "alert-rules",
+			},
+		},
+		Spec: monitoringv1.PrometheusRuleSpec{
+			Groups: []monitoringv1.RuleGroup{{
+				Name: "eco-gotests-cluster-redeploy",
+				Rules: []monitoringv1.Rule{{
+					Alert: "EcoGotestsClusterRedeployProbe",
+					Expr:  intstr.FromString("vector(1)"),
+					Labels: map[string]string{
+						"severity":            "warning",
+						"eco_gotests_test_id": testID,
+						"managed_cluster":     RANConfig.Spoke1Name,
+					},
+					Annotations: map[string]string{
+						"summary": "Temporary alert used by the eco-gotests cluster redeploy test",
+					},
+				}},
+			}},
+		},
+	}
+
+	if err := Spoke1APIClient.Create(context.Background(), rule); err != nil {
+		return nil, fmt.Errorf("failed to create PrometheusRule %s: %w", rule.Name, err)
+	}
+
+	return rule, nil
+}
+
+func acmSpokeMetricExists(api v1.API, spokeName string) (bool, error) {
+	query := fmt.Sprintf(`cluster_infrastructure_provider{cluster=%q}`, spokeName)
+	result, _, err := api.Query(context.Background(), query, time.Now())
+	if err != nil {
+		return false, fmt.Errorf("failed to query ACM Observability for spoke metrics: %w", err)
+	}
+
+	vector, ok := result.(model.Vector)
+	if !ok {
+		return false, fmt.Errorf("unexpected ACM Observability query result %T", result)
+	}
+
+	return len(vector) > 0, nil
+}
+
+func verifySpokeNodesReady() {
+	nodeList, err := Spoke1APIClient.K8sClient.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	Expect(err).ToNot(HaveOccurred(), "Failed to list spoke nodes")
+	Expect(nodeList.Items).ToNot(BeEmpty(), "Spoke returned no nodes")
+
+	for _, node := range nodeList.Items {
+		nodeReady := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+				nodeReady = true
+				break
+			}
+		}
+
+		Expect(nodeReady).To(BeTrue(), "Spoke node %s is not Ready", node.Name)
+	}
+}
+
+func acmSpokeAlertExists(api *alertmanagerv2.AlertmanagerAPI, testID string) (bool, error) {
+	filter := fmt.Sprintf(`eco_gotests_test_id=%q`, testID)
+	response, err := api.Alert.GetAlerts(
+		alertmanageralert.NewGetAlertsParamsWithTimeout(30 * time.Second).WithFilter([]string{filter}))
+	if err != nil {
+		return false, fmt.Errorf("failed to query ACM Alertmanager: %w", err)
+	}
+
+	return len(response.Payload) > 0, nil
+}
+
+func waitForClusterInstanceAbsent(name string, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(context.Background(), 5*time.Second, timeout, true,
+		func(context.Context) (bool, error) {
+			_, err := siteconfig.PullClusterInstance(HubAPIClient, name, name)
+			if k8serrors.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+
+			return false, nil
+		})
+}
+
+func waitForManagedClusterAbsent(name string, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(context.Background(), 5*time.Second, timeout, true,
+		func(context.Context) (bool, error) {
+			_, err := ocm.PullManagedCluster(HubAPIClient, name)
+			if k8serrors.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+
+			return false, nil
+		})
+}
+
+func recreateClusterInstance(original *siteconfigv1alpha1.ClusterInstance, timeout time.Duration) error {
+	current, err := siteconfig.PullClusterInstance(HubAPIClient, original.Name, original.Namespace)
+	if err == nil && current.Definition.DeletionTimestamp == nil {
+		_, err = current.WaitForCondition(metav1.Condition{
+			Type:   string(siteconfigv1alpha1.ClusterProvisioned),
+			Reason: string(siteconfigv1alpha1.Completed),
+		}, timeout)
+		return err
+	}
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check current cluster instance: %w", err)
+	}
+
+	if err = waitForClusterInstanceAbsent(original.Name, timeout); err != nil {
+		return fmt.Errorf("waiting for the old cluster instance to be removed: %w", err)
+	}
+
+	restored := original.DeepCopy()
+	restored.ResourceVersion = ""
+	restored.UID = ""
+	restored.Generation = 0
+	restored.CreationTimestamp = metav1.Time{}
+	restored.DeletionTimestamp = nil
+	restored.DeletionGracePeriodSeconds = nil
+	restored.ManagedFields = nil
+	restored.OwnerReferences = nil
+	restored.Finalizers = nil
+	restored.Status = siteconfigv1alpha1.ClusterInstanceStatus{}
+
+	builder := siteconfig.NewCIBuilder(HubAPIClient, restored.Name, restored.Namespace)
+	if builder == nil {
+		return fmt.Errorf("failed to create a ClusterInstance builder")
+	}
+	builder.Definition = restored
+	if _, err = builder.Create(); err != nil {
+		if !k8serrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to recreate ClusterInstance %s/%s: %w", restored.Namespace, restored.Name, err)
+		}
+
+		builder, err = siteconfig.PullClusterInstance(HubAPIClient, restored.Name, restored.Namespace)
+		if err != nil {
+			return fmt.Errorf("ClusterInstance appeared during recreation but could not be fetched: %w", err)
+		}
+	}
+
+	_, err = builder.WaitForCondition(metav1.Condition{
+		Type:   string(siteconfigv1alpha1.ClusterProvisioned),
+		Reason: string(siteconfigv1alpha1.Completed),
+	}, timeout)
+	if err != nil {
+		return fmt.Errorf("waiting for recreated ClusterInstance provisioning to complete: %w", err)
+	}
+
+	return nil
 }
