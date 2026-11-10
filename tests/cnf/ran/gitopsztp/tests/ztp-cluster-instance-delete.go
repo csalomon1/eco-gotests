@@ -26,6 +26,7 @@ import (
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/reportxml"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/route"
 	argocdtypes "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/argocd/argocdtypes/v1alpha1"
+	ocmclusterv1 "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/ocm/clusterv1"
 	siteconfigv1alpha1 "github.com/rh-ecosystem-edge/eco-goinfra/pkg/schemes/siteconfig/v1alpha1"
 	"github.com/rh-ecosystem-edge/eco-goinfra/pkg/siteconfig"
 	"github.com/rh-ecosystem-edge/eco-gotests/tests/cnf/ran/gitopsztp/internal/gitdetails"
@@ -39,6 +40,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -623,9 +625,14 @@ func acmSpokeAlertExists(api *alertmanagerv2.AlertmanagerAPI, testID string) (bo
 }
 
 func waitForClusterInstanceAbsent(name string, timeout time.Duration) error {
+	if err := HubAPIClient.AttachScheme(siteconfigv1alpha1.AddToScheme); err != nil {
+		return fmt.Errorf("failed to register ClusterInstance scheme: %w", err)
+	}
+
 	return wait.PollUntilContextTimeout(context.Background(), 5*time.Second, timeout, true,
-		func(context.Context) (bool, error) {
-			_, err := siteconfig.PullClusterInstance(HubAPIClient, name, name)
+		func(ctx context.Context) (bool, error) {
+			instance := &siteconfigv1alpha1.ClusterInstance{}
+			err := HubAPIClient.Get(ctx, k8stypes.NamespacedName{Name: name, Namespace: name}, instance)
 			if k8serrors.IsNotFound(err) {
 				return true, nil
 			}
@@ -638,9 +645,14 @@ func waitForClusterInstanceAbsent(name string, timeout time.Duration) error {
 }
 
 func waitForManagedClusterAbsent(name string, timeout time.Duration) error {
+	if err := HubAPIClient.AttachScheme(ocmclusterv1.Install); err != nil {
+		return fmt.Errorf("failed to register ManagedCluster scheme: %w", err)
+	}
+
 	return wait.PollUntilContextTimeout(context.Background(), 5*time.Second, timeout, true,
-		func(context.Context) (bool, error) {
-			_, err := ocm.PullManagedCluster(HubAPIClient, name)
+		func(ctx context.Context) (bool, error) {
+			managedCluster := &ocmclusterv1.ManagedCluster{}
+			err := HubAPIClient.Get(ctx, k8stypes.NamespacedName{Name: name}, managedCluster)
 			if k8serrors.IsNotFound(err) {
 				return true, nil
 			}
@@ -653,9 +665,21 @@ func waitForManagedClusterAbsent(name string, timeout time.Duration) error {
 }
 
 func recreateClusterInstance(original *siteconfigv1alpha1.ClusterInstance, timeout time.Duration) error {
-	current, err := siteconfig.PullClusterInstance(HubAPIClient, original.Name, original.Namespace)
-	if err == nil && current.Definition.DeletionTimestamp == nil {
-		_, err = current.WaitForCondition(metav1.Condition{
+	if err := HubAPIClient.AttachScheme(siteconfigv1alpha1.AddToScheme); err != nil {
+		return fmt.Errorf("failed to register ClusterInstance scheme: %w", err)
+	}
+
+	current := &siteconfigv1alpha1.ClusterInstance{}
+	err := HubAPIClient.Get(context.Background(), k8stypes.NamespacedName{
+		Name: original.Name, Namespace: original.Namespace,
+	}, current)
+	if err == nil && current.DeletionTimestamp == nil {
+		builder, err := siteconfig.PullClusterInstance(HubAPIClient, original.Name, original.Namespace)
+		if err != nil {
+			return fmt.Errorf("failed to pull existing ClusterInstance: %w", err)
+		}
+
+		_, err = builder.WaitForCondition(metav1.Condition{
 			Type:   string(siteconfigv1alpha1.ClusterProvisioned),
 			Reason: string(siteconfigv1alpha1.Completed),
 		}, timeout)
